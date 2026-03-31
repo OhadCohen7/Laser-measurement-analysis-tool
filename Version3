@@ -1,0 +1,1141 @@
+#!/usr/bin/env python3
+"""
+Position Measurement Analysis Tool
+Interactive GUI for analyzing repeatability measurements from CSV files.
+V3 - New feature in this version:
+    1. Seperate analysis for foward and backward direction.
+    2. load bunch of files and do the analysis for all file automaticlly.
+    3. Load bunch mode - analysis range according to user definition.
+    4. trend removal (linear or Polinomial)
+
+"""
+
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import os
+from datetime import datetime
+
+# ── Color palette ──────────────────────────────────────────────────────────────
+BG      = "#0f1117"
+PANEL   = "#1a1d27"
+ACCENT  = "#4f8ef7"
+ACCENT2 = "#f7a24f"
+TEXT    = "#e8eaf0"
+SUBTEXT = "#7a7f99"
+BORDER  = "#2a2d3e"
+SUCCESS = "#4fc97f"
+DANGER  = "#f74f6a"
+
+DISTINCT_COLORS = [
+    "#4f8ef7","#f7a24f","#4fc97f","#f74f6a","#c94ff7","#f7e24f",
+    "#4ff7f0","#f74fc9","#7af74f","#f7774f","#4f7af7","#f7c94f",
+    "#4ff7a2","#d44ff7","#f7f74f","#4fffd4","#ff4f8e","#a2f74f",
+    "#4f4ff7","#f7594f",
+]
+
+LOG_COLUMNS = [
+    "#", "Test Name", "Start #", "Num Runs",
+    "Worst Tgt All", "Worst 3\u03c3 All", "P50 All", "P99 All",
+    "Worst Tgt Fwd", "Worst 3\u03c3 Fwd", "P50 Fwd", "P99 Fwd",
+    "Worst Tgt Bwd", "Worst 3\u03c3 Bwd", "P50 Bwd", "P99 Bwd",
+    "Timestamp",
+]
+
+PLOT_MODES = [
+    ("Multi-target", "multi"),
+    ("Drift view",   "drift"),
+]
+
+
+# ── CSV parser ─────────────────────────────────────────────────────────────────
+
+def parse_csv(filepath):
+    df = pd.read_csv(filepath, header=0)
+    df.columns = [str(c).strip() for c in df.columns]
+    target_col = df.columns[1]
+    run_cols   = df.columns[2:]
+
+    run_labels = []
+    for i, _ in enumerate(run_cols):
+        run_num   = i // 2 + 1
+        direction = "+" if i % 2 == 0 else "\u2212"
+        run_labels.append(f"Run{run_num}{direction}")
+
+    data = {}
+    for _, row in df.iterrows():
+        tgt  = row[target_col]
+        vals = pd.to_numeric(row[run_cols], errors="coerce").values
+        if tgt not in data:
+            data[tgt] = []
+        data[tgt].append(vals)
+
+    for tgt in data:
+        arr = np.array(data[tgt], dtype=float)
+        data[tgt] = np.nanmean(arr, axis=0)
+
+    def sort_key(x):
+        try:    return float(x)
+        except: return 0
+
+    targets = sorted(data.keys(), key=sort_key)
+    return targets, list(run_labels), data
+
+
+# ── Main App ───────────────────────────────────────────────────────────────────
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Position Measurement Analysis")
+        self.geometry("1560x960")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+
+        # data state
+        self.targets     = []
+        self.run_labels  = []
+        self.data        = {}
+        self._start      = 0
+        self._end        = 0
+        self._sigma_vals = []
+        self._chk_vars   = {}
+        self._chk_widgets = []
+        self._fig        = None
+        self._ax1        = None
+        self._ax2        = None
+        self._canvas     = None
+        self._lines      = {}
+        self._drift_axes = []
+        self._log        = []
+        self._all_sigma_vals = {}
+
+        # tk vars (must be after super().__init__())
+        self._plot_mode     = tk.StringVar(master=self, value="multi")
+        self._direction     = tk.StringVar(master=self, value="all")
+        self._detrend_var   = tk.BooleanVar(master=self, value=False)
+        self._detrend_order = tk.IntVar(master=self, value=1)
+
+        self._style()
+        self._build_ui()
+
+    # ── ttk styling ──────────────────────────────────────────────────────────
+
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TFrame",        background=BG)
+        s.configure("TLabel",        background=BG, foreground=TEXT, font=("Courier New", 10))
+        s.configure("TButton",       background=ACCENT, foreground="#fff",
+                    font=("Courier New", 10, "bold"), borderwidth=0, relief="flat")
+        s.map("TButton",             background=[("active","#6aa3ff"), ("pressed","#3a78e0")])
+        s.configure("Run.TButton",   background=SUCCESS, foreground="#fff",
+                    font=("Courier New", 10, "bold"), borderwidth=0)
+        s.map("Run.TButton",         background=[("active","#6be09a"), ("pressed","#3ab86a")])
+        s.configure("Store.TButton", background=ACCENT2, foreground="#111",
+                    font=("Courier New", 10, "bold"), borderwidth=0)
+        s.map("Store.TButton",       background=[("active","#ffbe6e"), ("pressed","#e08820")])
+        s.configure("Del.TButton",   background=DANGER, foreground="#fff",
+                    font=("Courier New", 9, "bold"), borderwidth=0, padding=2)
+        s.map("Del.TButton",         background=[("active","#ff7a8a"), ("pressed","#c0002a")])
+        s.configure("Sm.TButton",    background=BORDER, foreground=SUBTEXT,
+                    font=("Courier New", 8), borderwidth=0, padding=2)
+        s.map("Sm.TButton",          background=[("active","#3a3d55")])
+        s.configure("TSpinbox",      background=PANEL, foreground=TEXT,
+                    fieldbackground=PANEL, insertbackground=TEXT,
+                    font=("Courier New", 10), arrowcolor=ACCENT)
+        s.configure("TScrollbar",    background=PANEL, troughcolor=BG, arrowcolor=ACCENT)
+        s.configure("TNotebook",     background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=PANEL, foreground=SUBTEXT,
+                    font=("Courier New", 10, "bold"), padding=[14, 6])
+        s.map("TNotebook.Tab",
+              background=[("selected", BG)],
+              foreground=[("selected", ACCENT)])
+        s.configure("Log.Treeview",
+                    background=PANEL, foreground=TEXT, fieldbackground=PANEL,
+                    font=("Courier New", 9), rowheight=24, borderwidth=0)
+        s.configure("Log.Treeview.Heading",
+                    background=BORDER, foreground=ACCENT,
+                    font=("Courier New", 9, "bold"), relief="flat")
+        s.map("Log.Treeview",
+              background=[("selected", ACCENT)],
+              foreground=[("selected", "#fff")])
+
+    # ── UI layout ────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Top bar
+        top = tk.Frame(self, bg=BG, pady=12, padx=20)
+        top.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(top, text="\u25c8 POSITION MEASUREMENT ANALYSIS", bg=BG,
+                 fg=ACCENT, font=("Courier New", 15, "bold")).pack(side=tk.LEFT)
+        ttk.Button(top, text="\u2295  Load CSV", command=self._load_csv).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(top, text="\u21d2  Batch Process", command=self._batch_process,
+                   style="Store.TButton").pack(side=tk.RIGHT, padx=6)
+        # Max reps entry (for batch mode)
+        tk.Label(top, text="Max reps:", bg=BG, fg=SUBTEXT,
+                 font=("Courier New", 9)).pack(side=tk.RIGHT, padx=(12, 2))
+        self._batch_max_var = tk.StringVar(master=self, value="")
+        self._batch_max_entry = tk.Entry(
+            top, textvariable=self._batch_max_var, width=6,
+            bg=BORDER, fg=TEXT, insertbackground=TEXT,
+            font=("Courier New", 9), relief="flat",
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT, justify="center")
+        self._batch_max_entry.pack(side=tk.RIGHT, padx=(0, 2))
+        self.lbl_file = tk.Label(top, text="No file loaded", bg=BG,
+                                 fg=SUBTEXT, font=("Courier New", 9))
+        self.lbl_file.pack(side=tk.RIGHT, padx=12)
+        tk.Frame(self, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # Body
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # Left sidebar
+        sidebar = tk.Frame(body, bg=PANEL, width=220, padx=14, pady=14)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+        self._build_sidebar(sidebar)
+
+        # Right: notebook
+        right = tk.Frame(body, bg=BG)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._notebook = ttk.Notebook(right)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: Analysis
+        self._tab_analysis = tk.Frame(self._notebook, bg=BG)
+        self._notebook.add(self._tab_analysis, text="  \u25f3  Analysis  ")
+
+        # Selector strip (hidden until data loaded)
+        self._sel_frame = tk.Frame(self._tab_analysis, bg=PANEL, pady=7, padx=10)
+        self._sel_inner_canvas = tk.Canvas(self._sel_frame, bg=PANEL,
+                                           height=28, highlightthickness=0)
+        self._sel_scrollbar = ttk.Scrollbar(self._sel_frame, orient="horizontal",
+                                             command=self._sel_inner_canvas.xview)
+        self._sel_inner_canvas.configure(xscrollcommand=self._sel_scrollbar.set)
+        self._sel_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._sel_inner_canvas.pack(side=tk.TOP, fill=tk.X)
+        self._sel_inner = tk.Frame(self._sel_inner_canvas, bg=PANEL)
+        self._sel_inner_canvas.create_window((0, 0), window=self._sel_inner, anchor="nw")
+        self._sel_inner.bind("<Configure>",
+            lambda e: self._sel_inner_canvas.configure(
+                scrollregion=self._sel_inner_canvas.bbox("all")))
+
+        self.canvas_frame = tk.Frame(self._tab_analysis, bg=BG)
+        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self._placeholder()
+
+        # Tab 2: Log
+        self._tab_log = tk.Frame(self._notebook, bg=BG)
+        self._notebook.add(self._tab_log, text="  \u2630  Results Log  ")
+        self._build_log_tab(self._tab_log)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+
+    def _build_sidebar(self, parent):
+        tk.Label(parent, text="ANALYSIS RANGE", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(anchor="w", pady=(0, 10))
+
+        tk.Label(parent, text="Start repetition #", bg=PANEL, fg=SUBTEXT,
+                 font=("Courier New", 9)).pack(anchor="w")
+        self._spin_start_var = tk.StringVar(master=self, value="")
+        self.spin_start = ttk.Spinbox(parent, from_=1, to=999, width=8,
+                                       textvariable=self._spin_start_var)
+        self.spin_start.pack(anchor="w", pady=(2, 10))
+
+        tk.Label(parent, text="Number of repetitions", bg=PANEL, fg=SUBTEXT,
+                 font=("Courier New", 9)).pack(anchor="w")
+        self._spin_count_var = tk.StringVar(master=self, value="")
+        self.spin_count = ttk.Spinbox(parent, from_=1, to=999, width=8,
+                                       textvariable=self._spin_count_var)
+        self.spin_count.pack(anchor="w", pady=(2, 18))
+
+        ttk.Button(parent, text="\u25b6  Run Analysis", style="Run.TButton",
+                   command=self._run_analysis).pack(fill=tk.X, pady=(0, 18))
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, pady=6)
+
+        tk.Label(parent, text="DETREND", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(anchor="w", pady=(4, 4))
+        tk.Checkbutton(
+            parent, text="Remove trend", variable=self._detrend_var,
+            bg=PANEL, fg=TEXT, selectcolor="#2a2d3e",
+            activebackground=PANEL, activeforeground=TEXT,
+            font=("Courier New", 9), cursor="hand2"
+        ).pack(anchor="w")
+        tk.Label(parent, text="Fit order:", bg=PANEL, fg=SUBTEXT,
+                 font=("Courier New", 9)).pack(anchor="w", pady=(6, 2))
+        for lbl, val in [("Linear (1st)", 1), ("Quadratic (2nd)", 2)]:
+            tk.Radiobutton(
+                parent, text=lbl, variable=self._detrend_order, value=val,
+                bg=PANEL, fg=TEXT, selectcolor="#2a2d3e",
+                activebackground=PANEL, activeforeground=TEXT,
+                font=("Courier New", 8), indicatoron=1, cursor="hand2"
+            ).pack(anchor="w")
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, pady=(10, 6))
+
+        tk.Label(parent, text="DATA INFO", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(anchor="w", pady=(8, 6))
+        self.info_targets = tk.Label(parent, text="Targets: \u2014", bg=PANEL, fg=TEXT,
+                                      font=("Courier New", 9), wraplength=190, justify="left")
+        self.info_targets.pack(anchor="w", pady=1)
+        self.info_runs = tk.Label(parent, text="Runs: \u2014", bg=PANEL, fg=TEXT,
+                                   font=("Courier New", 9))
+        self.info_runs.pack(anchor="w", pady=1)
+        self.info_range = tk.Label(parent, text="Range: \u2014", bg=PANEL, fg=TEXT,
+                                    font=("Courier New", 9))
+        self.info_range.pack(anchor="w", pady=1)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, pady=10)
+
+        # 3σ section header
+        tk.Label(parent, text="3\u03c3 RESULTS", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(anchor="w", pady=(0, 4))
+
+        # Direction toggle: All | Fwd | Bwd
+        dir_frame = tk.Frame(parent, bg=PANEL)
+        dir_frame.pack(fill=tk.X, pady=(0, 6))
+        for lbl, val, col in [("All", "all", ACCENT),
+                               ("Fwd \u2192", "fwd", SUCCESS),
+                               ("\u2190 Bwd", "bwd", ACCENT2)]:
+            tk.Radiobutton(
+                dir_frame, text=lbl, variable=self._direction, value=val,
+                bg=PANEL, fg=col, selectcolor="#2a2d3e",
+                activebackground=PANEL, activeforeground=col,
+                font=("Courier New", 8, "bold"), indicatoron=0,
+                width=4, relief="flat", cursor="hand2",
+                command=self._on_direction_change
+            ).pack(side=tk.LEFT, padx=2)
+
+        # Table area (filled by _refresh_sigma_table)
+        self.sigma_frame = tk.Frame(parent, bg=PANEL)
+        self.sigma_frame.pack(fill=tk.X)
+
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, pady=10)
+
+        # Store Results
+        tk.Label(parent, text="STORE RESULTS", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(parent, text="Test name", bg=PANEL, fg=SUBTEXT,
+                 font=("Courier New", 9)).pack(anchor="w")
+        self._test_name_var = tk.StringVar(master=self)
+        self._entry_test_name = tk.Entry(
+            parent, textvariable=self._test_name_var,
+            bg=BORDER, fg=TEXT, insertbackground=TEXT,
+            font=("Courier New", 9), relief="flat",
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self._entry_test_name.pack(fill=tk.X, pady=(2, 10))
+        ttk.Button(parent, text="\u22b3  Store Results", style="Store.TButton",
+                   command=self._store_results).pack(fill=tk.X)
+
+    # ── Log tab ───────────────────────────────────────────────────────────────
+
+    def _build_log_tab(self, parent):
+        toolbar = tk.Frame(parent, bg=BG, pady=10, padx=16)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(toolbar, text="RESULTS LOG", bg=BG, fg=ACCENT,
+                 font=("Courier New", 12, "bold")).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="\u21e9  Export CSV",
+                   command=self._export_log).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(toolbar, text="\u2715  Clear All", style="Del.TButton",
+                   command=self._clear_log).pack(side=tk.RIGHT, padx=4)
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
+
+        tree_frame = tk.Frame(parent, bg=BG)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical")
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal")
+        self._log_tree = ttk.Treeview(
+            tree_frame, columns=LOG_COLUMNS, show="headings",
+            style="Log.Treeview", yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.configure(command=self._log_tree.yview)
+        hsb.configure(command=self._log_tree.xview)
+
+        col_widths = {
+            "#": 36, "Test Name": 145, "Start #": 52, "Num Runs": 62,
+            "Worst Tgt All": 88, "Worst 3\u03c3 All": 85, "P50 All": 75, "P99 All": 75,
+            "Worst Tgt Fwd": 88, "Worst 3\u03c3 Fwd": 85, "P50 Fwd": 75, "P99 Fwd": 75,
+            "Worst Tgt Bwd": 88, "Worst 3\u03c3 Bwd": 85, "P50 Bwd": 75, "P99 Bwd": 75,
+            "Timestamp": 145,
+        }
+        for col in LOG_COLUMNS:
+            self._log_tree.heading(col, text=col)
+            self._log_tree.column(col, width=col_widths.get(col, 90),
+                                  anchor="center", stretch=False)
+        self._log_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self._log_tree.tag_configure("odd",  background="#151824")
+        self._log_tree.tag_configure("even", background=PANEL)
+        self._log_tree.bind("<Button-3>", self._on_row_rightclick)
+
+        self._log_status = tk.Label(parent, text="No entries yet.", bg=BG,
+                                     fg=SUBTEXT, font=("Courier New", 8),
+                                     anchor="w", padx=16)
+        self._log_status.pack(side=tk.BOTTOM, fill=tk.X, pady=4)
+
+    # ── Selector / mode strip ─────────────────────────────────────────────────
+
+    def _build_selector(self):
+        for w in self._sel_inner.winfo_children():
+            w.destroy()
+        self._chk_vars    = {}
+        self._chk_widgets = []
+
+        # Plot mode radios
+        tk.Label(self._sel_inner, text="PLOT MODE:", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        for label, value in PLOT_MODES:
+            tk.Radiobutton(
+                self._sel_inner, text=label, variable=self._plot_mode, value=value,
+                bg=PANEL, fg=TEXT, selectcolor="#2a2d3e",
+                activebackground=PANEL, activeforeground=TEXT,
+                font=("Courier New", 8), indicatoron=1, cursor="hand2"
+            ).pack(side=tk.LEFT, padx=3)
+
+        tk.Frame(self._sel_inner, bg=BORDER, width=1, height=22).pack(side=tk.LEFT, padx=10)
+
+        # Target checkboxes
+        tk.Label(self._sel_inner, text="SHOW TARGETS:", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_all  = ttk.Button(self._sel_inner, text="All",  style="Sm.TButton",
+                                     command=self._sel_all_only)
+        self._btn_none = ttk.Button(self._sel_inner, text="None", style="Sm.TButton",
+                                     command=self._sel_none_only)
+        self._btn_all.pack(side=tk.LEFT, padx=2)
+        self._btn_none.pack(side=tk.LEFT, padx=(2, 14))
+        tk.Frame(self._sel_inner, bg=BORDER, width=1, height=22).pack(side=tk.LEFT, padx=6)
+
+        for idx, tgt in enumerate(self.targets):
+            color = DISTINCT_COLORS[idx % len(DISTINCT_COLORS)]
+            var   = tk.BooleanVar(master=self, value=True)
+            self._chk_vars[tgt] = var
+            cell = tk.Frame(self._sel_inner, bg=PANEL)
+            cell.pack(side=tk.LEFT, padx=4)
+            sw = tk.Canvas(cell, width=11, height=11, bg=PANEL, highlightthickness=0)
+            sw.create_oval(1, 1, 10, 10, fill=color, outline="")
+            sw.pack(side=tk.LEFT, padx=(0, 2))
+            cb = tk.Checkbutton(cell, text=str(tgt), variable=var,
+                                bg=PANEL, fg=TEXT, selectcolor="#2a2d3e",
+                                activebackground=PANEL, activeforeground=TEXT,
+                                font=("Courier New", 8), cursor="hand2")
+            cb.pack(side=tk.LEFT)
+            self._chk_widgets.append((sw, cb, cell))
+
+        # Separator + Update Plot button
+        tk.Frame(self._sel_inner, bg=BORDER, width=1, height=22).pack(side=tk.LEFT, padx=10)
+        ttk.Button(self._sel_inner, text="\u21bb  Update Plot", style="Run.TButton",
+                   command=self._apply_plot1_selection).pack(side=tk.LEFT, padx=6)
+
+        self._sel_frame.pack(side=tk.TOP, fill=tk.X, before=self.canvas_frame)
+        self._sync_mode_ui()
+
+    def _on_mode_change(self):
+        self._sync_mode_ui()
+
+    def _sync_mode_ui(self):
+        is_multi = self._plot_mode.get() == "multi"
+        state = tk.NORMAL if is_multi else tk.DISABLED
+        for _, cb, _ in self._chk_widgets:
+            cb.config(state=state)
+        for btn in [getattr(self, "_btn_all", None), getattr(self, "_btn_none", None)]:
+            if btn:
+                btn.state(["!disabled"] if is_multi else ["disabled"])
+
+    def _sel_all_only(self):
+        for v in self._chk_vars.values(): v.set(True)
+
+    def _sel_none_only(self):
+        for v in self._chk_vars.values(): v.set(False)
+
+    def _apply_plot1_selection(self):
+        if self._ax1 is None or self._fig is None:
+            return
+        for a in self._drift_axes:
+            try: a.remove()
+            except Exception: pass
+        self._drift_axes = []
+        self._ax1.set_visible(True)
+        self._ax1.cla()
+        self._ax1.set_facecolor(PANEL)
+        self._ax1.tick_params(colors=SUBTEXT, labelsize=8)
+        for sp in self._ax1.spines.values(): sp.set_color(BORDER)
+        self._ax1.grid(True, color=BORDER, linewidth=0.6, linestyle="--", alpha=0.7)
+        self._ax1.yaxis.label.set_color(TEXT)
+        self._ax1.xaxis.label.set_color(TEXT)
+        self._ax1.title.set_color(TEXT)
+        self._draw_plot1(self._ax1, self._start, self._end)
+        self._canvas.draw()
+
+    # ── Direction helpers ─────────────────────────────────────────────────────
+
+    def _filter_vals(self, vals):
+        d = self._direction.get()
+        if d == "fwd": return vals[0::2]
+        if d == "bwd": return vals[1::2]
+        return vals
+
+    def _compute_sigma_vals(self, start, end, direction_override=None):
+        saved = self._direction.get()
+        if direction_override:
+            self._direction.set(direction_override)
+        result = []
+        for tgt in self.targets:
+            v      = self._filter_vals(self.data[tgt][start:end])
+            v      = self._detrend_vals(v)
+            finite = v[np.isfinite(v)]
+            result.append(3 * np.nanstd(finite, ddof=1) if len(finite) > 1 else 0.0)
+        if direction_override:
+            self._direction.set(saved)
+        return result
+
+    def _on_direction_change(self):
+        if self._fig is not None and self._sigma_vals:
+            self._refresh_sigma_table(self._start, self._end)
+
+    def _refresh_sigma_table(self, start, end):
+        sigma_vals = self._compute_sigma_vals(start, end)
+        self._sigma_vals = sigma_vals
+
+        for w in self.sigma_frame.winfo_children():
+            w.destroy()
+
+        # Direction label
+        dir_names = {"all": "All runs",
+                     "fwd": "Forward (+) only",
+                     "bwd": "Backward (\u2212) only"}
+        tk.Label(self.sigma_frame,
+                 text=dir_names.get(self._direction.get(), ""),
+                 bg=PANEL, fg=SUBTEXT,
+                 font=("Courier New", 7, "italic")).pack(anchor="w", pady=(0, 4))
+
+        # Per-target rows
+        for tgt, sv in zip(self.targets, sigma_vals):
+            row = tk.Frame(self.sigma_frame, bg=PANEL)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=str(tgt), bg=PANEL, fg=SUBTEXT,
+                     font=("Courier New", 8), width=10, anchor="w").pack(side=tk.LEFT)
+            col = SUCCESS if sv == min(sigma_vals) else (DANGER if sv == max(sigma_vals) else TEXT)
+            tk.Label(row, text=f"{sv:.5f}", bg=PANEL, fg=col,
+                     font=("Courier New", 8), anchor="e").pack(side=tk.RIGHT)
+
+        # Divider + percentiles
+        p50 = float(np.percentile(sigma_vals, 50))
+        p99 = float(np.percentile(sigma_vals, 99))
+        tk.Frame(self.sigma_frame, bg=BORDER, height=1).pack(fill=tk.X, pady=6)
+        for label, value, color in [("P50 (\u03bcm)", p50, ACCENT),
+                                     ("P99 (\u03bcm)", p99, ACCENT2)]:
+            row = tk.Frame(self.sigma_frame, bg=PANEL)
+            row.pack(fill=tk.X, pady=2)
+            tk.Label(row, text=label, bg=PANEL, fg=color,
+                     font=("Courier New", 8, "bold"), anchor="w").pack(side=tk.LEFT)
+            tk.Label(row, text=f"{value:.5f}", bg=PANEL, fg=color,
+                     font=("Courier New", 8, "bold"), anchor="e").pack(side=tk.RIGHT)
+
+    # ── Batch processing ─────────────────────────────────────────────────────
+
+    def _batch_process(self):
+        """Load multiple CSVs, analyse each with current range settings, store all to log."""
+        filepaths = filedialog.askopenfilenames(
+            title="Select CSV files for batch processing",
+            filetypes=[("CSV files", "*.csv"), ("All", "*.*")])
+        if not filepaths:
+            return
+
+        filepaths = list(filepaths)
+        n_files   = len(filepaths)
+
+        # ── Progress dialog ───────────────────────────────────────────────────
+        dlg = tk.Toplevel(self)
+        dlg.title("Batch Processing")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        w, h = 420, 160
+        dlg.geometry(f"{w}x{h}+{self.winfo_rootx()+(self.winfo_width()-w)//2}"
+                     f"+{self.winfo_rooty()+(self.winfo_height()-h)//2}")
+
+        tk.Label(dlg, text="BATCH PROCESSING", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 11, "bold")).pack(pady=(16, 4))
+        lbl_status = tk.Label(dlg, text="Starting...", bg=PANEL, fg=TEXT,
+                               font=("Courier New", 9), wraplength=380)
+        lbl_status.pack(pady=4)
+
+        style = ttk.Style(dlg)
+        style.configure("Batch.Horizontal.TProgressbar",
+                         troughcolor=BORDER, background=ACCENT,
+                         darkcolor=ACCENT, lightcolor=ACCENT, bordercolor=PANEL)
+        pb = ttk.Progressbar(dlg, style="Batch.Horizontal.TProgressbar",
+                              orient="horizontal", length=360,
+                              mode="determinate", maximum=n_files)
+        pb.pack(pady=8, padx=30)
+        lbl_count = tk.Label(dlg, text=f"0 / {n_files}", bg=PANEL, fg=SUBTEXT,
+                              font=("Courier New", 8))
+        lbl_count.pack()
+        dlg.update()
+
+        # ── Determine per-file range from the "Max reps" batch field ────────────
+        max_raw = self._batch_max_var.get().strip()
+        batch_max = int(max_raw) if max_raw.isdigit() and int(max_raw) > 0 else None
+
+        def get_range(n_runs):
+            if batch_max is None or batch_max >= n_runs:
+                # Use all available runs
+                return 0, n_runs
+            else:
+                # Take the last batch_max runs
+                return n_runs - batch_max, n_runs
+
+        # ── Helper: compute 3-sigma list for a given direction ────────────────
+        def sigma_for(targets, data, start, end, direction):
+            result = []
+            for tgt in targets:
+                v = data[tgt][start:end]
+                if direction == "fwd":  v = v[0::2]
+                elif direction == "bwd": v = v[1::2]
+                finite = v[np.isfinite(v)]
+                result.append(3 * np.nanstd(finite, ddof=1) if len(finite) > 1 else 0.0)
+            return result
+
+        # ── Process each file ─────────────────────────────────────────────────
+        errors = []
+        n_ok   = 0
+        last   = {}   # store last successful result to update the main UI
+
+        for i, fp in enumerate(filepaths):
+            fname = os.path.basename(fp)
+            lbl_status.config(text=f"Processing:  {fname}")
+            lbl_count.config(text=f"{i + 1} / {n_files}")
+            pb["value"] = i + 1
+            dlg.update()
+
+            try:
+                targets, run_labels, data = parse_csv(fp)
+                start, end = get_range(len(run_labels))
+
+                all_sv = sigma_for(targets, data, start, end, "all")
+                fwd_sv = sigma_for(targets, data, start, end, "fwd")
+                bwd_sv = sigma_for(targets, data, start, end, "bwd")
+
+                test_name = os.path.splitext(fname)[0]
+                entry = {
+                    "#":         len(self._log) + 1,
+                    "Test Name": test_name,
+                    "Start #":   start + 1,
+                    "Num Runs":  end - start,
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for key, sv in [("All", all_sv), ("Fwd", fwd_sv), ("Bwd", bwd_sv)]:
+                    wi = int(np.argmax(sv))
+                    entry[f"Worst Tgt {key}"]     = targets[wi]
+                    entry[f"Worst 3\u03c3 {key}"] = f"{sv[wi]:.5f}"
+                    entry[f"P50 {key}"]            = f"{float(np.percentile(sv, 50)):.5f}"
+                    entry[f"P99 {key}"]            = f"{float(np.percentile(sv, 99)):.5f}"
+
+                self._log.append(entry)
+                n_ok += 1
+                last = dict(targets=targets, run_labels=run_labels, data=data,
+                            start=start, end=end,
+                            all_sigma=all_sv, fwd_sigma=fwd_sv, bwd_sigma=bwd_sv)
+
+            except Exception as exc:
+                errors.append(f"  {fname}: {exc}")
+
+        dlg.destroy()
+
+        # Refresh log
+        self._refresh_log_tree()
+
+        # Update main UI with the last successfully processed file
+        if last:
+            self.targets    = last["targets"]
+            self.run_labels = last["run_labels"]
+            self.data       = last["data"]
+            self._start     = last["start"]
+            self._end       = last["end"]
+            self._sigma_vals     = last["all_sigma"]
+            self._all_sigma_vals = {"all": last["all_sigma"],
+                                    "fwd": last["fwd_sigma"],
+                                    "bwd": last["bwd_sigma"]}
+            self.lbl_file.config(text=f"{n_ok} file(s) processed", fg=SUCCESS)
+            self.info_targets.config(text=f"Targets: {len(self.targets)}")
+            self.info_runs.config(text=f"Runs: {len(self.run_labels)}")
+            self.info_range.config(text=f"Range: {self._start + 1}\u2013{self._end}")
+            self.spin_start.config(to=len(self.run_labels))
+            self.spin_count.config(to=len(self.run_labels))
+            self._build_selector()
+            self._refresh_sigma_table(self._start, self._end)
+            self._notebook.select(self._tab_log)
+
+        # Summary
+        msg = f"Batch complete.\n\n\u2713  {n_ok} file(s) added to the log."
+        if errors:
+            msg += f"\n\u2717  {len(errors)} error(s):\n" + "\n".join(errors)
+            messagebox.showwarning("Batch Complete", msg)
+        else:
+            messagebox.showinfo("Batch Complete", msg)
+
+    # ── Load CSV ──────────────────────────────────────────────────────────────
+    # ── Load CSV ──────────────────────────────────────────────────────────────
+
+    def _load_csv(self):
+        fp = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv"), ("All", "*.*")])
+        if not fp: return
+        try:
+            self.targets, self.run_labels, self.data = parse_csv(fp)
+            self.lbl_file.config(text=os.path.basename(fp), fg=SUCCESS)
+            n = len(self.run_labels)
+            self.info_targets.config(text=f"Targets: {len(self.targets)}")
+            self.info_runs.config(text=f"Runs: {n}")
+            self.spin_start.config(to=n)
+            self.spin_count.config(to=n)
+            self._build_selector()
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
+    # ── Run analysis ──────────────────────────────────────────────────────────
+
+    def _run_analysis(self):
+        if not self.targets:
+            messagebox.showwarning("No Data", "Please load a CSV file first.")
+            return
+        n_runs = len(self.run_labels)
+
+        start_raw = self.spin_start.get().strip()
+        if start_raw == "":
+            start = 0
+        elif start_raw.lstrip("-").isdigit():
+            start = int(start_raw) - 1
+        else:
+            messagebox.showerror("Input Error", "Start repetition must be an integer.")
+            return
+
+        count_raw = self.spin_count.get().strip()
+        if count_raw == "":
+            count = n_runs - start
+        elif count_raw.isdigit():
+            count = int(count_raw)
+        else:
+            messagebox.showerror("Input Error", "Number of repetitions must be an integer.")
+            return
+
+        end = start + count
+        if start < 0 or start >= n_runs:
+            messagebox.showerror("Range Error", f"Start must be between 1 and {n_runs}.")
+            return
+        if end > n_runs:
+            messagebox.showwarning("Range Clipped",
+                f"Only {n_runs - start} repetitions available. Clipping.")
+            end = n_runs
+
+        self._start = start
+        self._end   = end
+        self.info_range.config(text=f"Range: {start + 1}\u2013{end}")
+        self._draw(start, end)
+
+    # ── Store results ─────────────────────────────────────────────────────────
+
+    def _store_results(self):
+        if not self._sigma_vals:
+            messagebox.showwarning("No Results", "Run an analysis first.")
+            return
+        test_name = self._test_name_var.get().strip()
+        if not test_name:
+            messagebox.showwarning("Missing Name", "Please enter a test name.")
+            self._entry_test_name.focus_set()
+            return
+
+        entry = {
+            "#":          len(self._log) + 1,
+            "Test Name":  test_name,
+            "Start #":    self._start + 1,
+            "Num Runs":   self._end - self._start,
+            "Timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for key, dname in [("All", "all"), ("Fwd", "fwd"), ("Bwd", "bwd")]:
+            sv = self._all_sigma_vals.get(dname, self._sigma_vals)
+            wi = int(np.argmax(sv))
+            entry[f"Worst Tgt {key}"]  = self.targets[wi]
+            entry[f"Worst 3\u03c3 {key}"] = f"{sv[wi]:.5f}"
+            entry[f"P50 {key}"]        = f"{float(np.percentile(sv, 50)):.5f}"
+            entry[f"P99 {key}"]        = f"{float(np.percentile(sv, 99)):.5f}"
+
+        self._log.append(entry)
+        self._refresh_log_tree()
+        self._notebook.select(self._tab_log)
+
+    # ── Log helpers ───────────────────────────────────────────────────────────
+
+    def _refresh_log_tree(self):
+        for item in self._log_tree.get_children():
+            self._log_tree.delete(item)
+        for i, entry in enumerate(self._log):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._log_tree.insert("", "end", iid=str(i),
+                                  values=[entry.get(c, "") for c in LOG_COLUMNS],
+                                  tags=(tag,))
+        n = len(self._log)
+        self._log_status.config(
+            text=f"{n} entr{'y' if n == 1 else 'ies'} stored." if n else "No entries yet.")
+
+    def _on_row_rightclick(self, event):
+        row = self._log_tree.identify_row(event.y)
+        if not row: return
+        self._log_tree.selection_set(row)
+        menu = tk.Menu(self, tearoff=0, bg=PANEL, fg=TEXT,
+                       activebackground=DANGER, activeforeground="#fff",
+                       font=("Courier New", 9))
+        menu.add_command(label="\u2715  Delete this entry",
+                         command=lambda: self._delete_row(row))
+        menu.post(event.x_root, event.y_root)
+
+    def _delete_row(self, iid):
+        self._log.pop(int(iid))
+        for i, e in enumerate(self._log): e["#"] = i + 1
+        self._refresh_log_tree()
+
+    def _clear_log(self):
+        if not self._log: return
+        if messagebox.askyesno("Clear Log", "Delete all log entries?"):
+            self._log.clear()
+            self._refresh_log_tree()
+
+    def _export_log(self):
+        if not self._log:
+            messagebox.showinfo("Empty Log", "Nothing to export yet.")
+            return
+        fp = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All", "*.*")],
+            initialfile="results_log.csv")
+        if not fp: return
+        try:
+            pd.DataFrame(self._log)[LOG_COLUMNS].to_csv(fp, index=False)
+            messagebox.showinfo("Exported", f"Log saved to:\n{fp}")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
+
+    def _detrend_vals(self, vals):
+        """Remove polynomial trend from vals (separate fit per target).
+        Returns vals unchanged when detrend mode is off.
+        """
+        if not self._detrend_var.get():
+            return vals
+        order  = self._detrend_order.get()
+        x      = np.arange(len(vals), dtype=float)
+        finite = np.isfinite(vals)
+        if finite.sum() < order + 1:
+            return vals
+        trend = np.polyval(np.polyfit(x[finite], vals[finite], order), x)
+        return vals - trend
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def _placeholder(self):
+        for w in self.canvas_frame.winfo_children(): w.destroy()
+        tk.Label(self.canvas_frame,
+                 text="Load a CSV file and click\n\u25b6  Run Analysis",
+                 bg=BG, fg=SUBTEXT, font=("Courier New", 14)
+                 ).place(relx=0.5, rely=0.5, anchor="center")
+
+    def _draw(self, start, end):
+        for w in self.canvas_frame.winfo_children(): w.destroy()
+        self._lines      = {}
+        self._drift_axes = []
+
+        fig = plt.Figure(figsize=(12, 8), facecolor=BG)
+        gs  = gridspec.GridSpec(2, 1, figure=fig, hspace=0.55,
+                                top=0.95, bottom=0.10, left=0.07, right=0.82)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+        self._fig = fig
+        self._ax1 = ax1
+        self._ax2 = ax2
+
+        for ax in (ax1, ax2):
+            ax.set_facecolor(PANEL)
+            ax.tick_params(colors=SUBTEXT, labelsize=8)
+            for sp in ax.spines.values(): sp.set_color(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.6, linestyle="--", alpha=0.7)
+            ax.yaxis.label.set_color(TEXT)
+            ax.xaxis.label.set_color(TEXT)
+            ax.title.set_color(TEXT)
+
+        # Plot 1
+        self._draw_plot1(ax1, start, end)
+
+        # Plot 2: 3σ bar chart
+        detrending = self._detrend_var.get()
+        _ord_lbl   = "linear" if self._detrend_order.get() == 1 else "quadratic"
+        title2 = ("3\u03c3 Standard Deviation per Target Position"
+                  + (f"  (with & without {_ord_lbl} trend removal)" if detrending else ""))
+        ax2.set_title(title2, fontsize=10, color=TEXT, pad=8)
+        ax2.set_xlabel("Target Position (\u03bcm)", fontsize=9)
+        ax2.set_ylabel("3\u03c3 (\u03bcm)", fontsize=9)
+
+        # Always compute raw (no detrend) sigma
+        # Temporarily disable detrend to get raw values
+        self._detrend_var.set(False)
+        bar_sigma_raw = self._compute_sigma_vals(start, end, "all")
+        self._detrend_var.set(detrending)
+
+        if detrending:
+            bar_sigma_det = self._compute_sigma_vals(start, end, "all")
+            bar_x   = np.arange(len(self.targets))
+            w       = 0.38
+            x_raw   = bar_x - w / 2
+            x_det   = bar_x + w / 2
+            max_s   = max(max(bar_sigma_raw), max(bar_sigma_det)) if bar_sigma_raw else 1
+
+            # Raw bars (colour-coded red/green gradient)
+            for bx, sv in zip(x_raw, bar_sigma_raw):
+                ratio = sv / max_s
+                clr   = (ratio * 0.8 + 0.2, (1 - ratio * 0.5) * 0.5 + 0.2, 0.3)
+                ax2.bar(bx, sv, width=w, color=clr, edgecolor=BORDER,
+                        linewidth=0.5, alpha=0.85)
+                ax2.text(bx, sv + max_s * 0.01, f"{sv:.4f}",
+                         ha="center", va="bottom", fontsize=6,
+                         color=TEXT, fontfamily="Courier New")
+
+            # Detrended bars (blue tones)
+            for bx, sv in zip(x_det, bar_sigma_det):
+                ratio = sv / max_s
+                clr   = (0.2, 0.4 + ratio * 0.2, 0.7 + ratio * 0.2)
+                ax2.bar(bx, sv, width=w, color=clr, edgecolor=BORDER,
+                        linewidth=0.5, alpha=0.85)
+                ax2.text(bx, sv + max_s * 0.01, f"{sv:.4f}",
+                         ha="center", va="bottom", fontsize=6,
+                         color=ACCENT, fontfamily="Courier New")
+
+            ax2.set_xticks(bar_x)
+            ax2.set_xticklabels([str(t) for t in self.targets],
+                                rotation=45, ha="right", fontsize=8)
+            ax2.set_xlim(-0.5, len(self.targets) - 0.5)
+
+            # Legend
+            from matplotlib.patches import Patch
+            ax2.legend(
+                handles=[
+                    Patch(facecolor=(0.6, 0.35, 0.3), label="Raw"),
+                    Patch(facecolor=(0.2, 0.55, 0.85), label=f"Detrended ({_ord_lbl})"),
+                ],
+                loc="upper right", frameon=True, facecolor=PANEL,
+                edgecolor=BORDER, labelcolor=TEXT, fontsize=8)
+
+        else:
+            # Single bar, original behaviour
+            bar_x = np.arange(len(self.targets))
+            max_s = max(bar_sigma_raw) if max(bar_sigma_raw) > 0 else 1
+            bars  = ax2.bar(bar_x, bar_sigma_raw, color=ACCENT, edgecolor=BORDER,
+                            linewidth=0.6, alpha=0.85, width=0.6)
+            for bar, sv in zip(bars, bar_sigma_raw):
+                ratio = sv / max_s
+                bar.set_facecolor((ratio * 0.8 + 0.2, (1 - ratio * 0.5) * 0.5 + 0.2, 0.3))
+            for bx, sv in zip(bar_x, bar_sigma_raw):
+                ax2.text(bx, sv + max_s * 0.01, f"{sv:.4f}",
+                         ha="center", va="bottom", fontsize=7,
+                         color=TEXT, fontfamily="Courier New")
+            ax2.set_xticks(bar_x)
+            ax2.set_xticklabels([str(t) for t in self.targets],
+                                rotation=45, ha="right", fontsize=8)
+            ax2.set_xlim(-0.5, len(self.targets) - 0.5)
+
+        # Embed canvas
+        canvas = FigureCanvasTkAgg(fig, master=self.canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas = canvas
+        tb_frame = tk.Frame(self.canvas_frame, bg=BG)
+        tb_frame.pack(fill=tk.X)
+        tb = NavigationToolbar2Tk(canvas, tb_frame)
+        tb.config(bg=BG)
+        tb.update()
+
+        # Pre-compute all directions for Store Results
+        self._all_sigma_vals = {
+            "all": self._compute_sigma_vals(start, end, "all"),
+            "fwd": self._compute_sigma_vals(start, end, "fwd"),
+            "bwd": self._compute_sigma_vals(start, end, "bwd"),
+        }
+
+        # Sidebar 3σ table (respects current direction toggle)
+        self._refresh_sigma_table(start, end)
+
+        # Reset checkboxes
+        for var in self._chk_vars.values(): var.set(True)
+
+    # ── Plot 1 renderer (multi + drift modes) ────────────────────────────────
+
+    def _draw_plot1(self, ax, start, end):
+        self._lines = {}
+        run_indices = list(range(start, end))
+        n_reps      = len(run_indices)
+        x           = np.arange(1, n_reps + 1)
+        x_labels    = [self.run_labels[i] for i in run_indices]
+        mode        = self._plot_mode.get()
+
+        ax.set_ylabel("Error (\u03bcm)", fontsize=9)
+        ax.set_xlabel("Repetition number", fontsize=9)
+
+        if mode == "multi":
+            _ord = "linear" if self._detrend_order.get()==1 else "quadratic"
+            _det = f"  [{_ord} trend removed]" if self._detrend_var.get() else ""
+            ax.set_title(
+                f"Error vs Repetition Number{_det}  \u2014  checkboxes filter targets",
+                fontsize=10, color=TEXT, pad=8)
+
+            for idx, tgt in enumerate(self.targets):
+                color = DISTINCT_COLORS[idx % len(DISTINCT_COLORS)]
+                vals  = self._detrend_vals(self.data[tgt][start:end])
+                line, = ax.plot(x, vals, marker="o", markersize=3, linewidth=1.2,
+                                color=color, label=str(tgt))
+                self._lines[tgt] = line
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(x_labels, rotation=90, ha="right", fontsize=5)
+
+            leg = ax.legend(
+                title="Target Position (\u03bcm)", loc="upper left",
+                bbox_to_anchor=(1.01, 1.0), ncol=1, frameon=True,
+                facecolor=PANEL, edgecolor=BORDER, labelcolor=TEXT,
+                fontsize=7, title_fontsize=8)
+            leg.get_title().set_color(ACCENT)
+
+        else:
+            # Drift view: stacked sub-axes, one per visible target
+            ax.set_visible(False)
+
+            for a in self._drift_axes:
+                try: a.remove()
+                except Exception: pass
+            self._drift_axes = []
+
+            visible_targets = [t for t in self.targets
+                               if self._chk_vars.get(t) is None or self._chk_vars[t].get()]
+            if not visible_targets:
+                visible_targets = self.targets
+
+            n_tgt   = len(visible_targets)
+            pos     = ax.get_position()
+            h_total = pos.height
+            w       = pos.width
+            x0      = pos.x0
+            y0      = pos.y0
+            h_each  = h_total / n_tgt
+            gap     = 0.004
+
+            for i, tgt in enumerate(visible_targets):
+                color  = DISTINCT_COLORS[self.targets.index(tgt) % len(DISTINCT_COLORS)]
+                vals   = self.data[tgt][start:end]
+                y_pos  = y0 + (n_tgt - 1 - i) * h_each
+                height = h_each - gap
+
+                sub_ax = self._fig.add_axes([x0, y_pos, w, height])
+                self._drift_axes.append(sub_ax)
+
+                sub_ax.set_facecolor(PANEL)
+                sub_ax.tick_params(colors=SUBTEXT, labelsize=6, length=2)
+                for sp in sub_ax.spines.values(): sp.set_color(BORDER)
+                sub_ax.grid(True, color=BORDER, linewidth=0.4, linestyle="--", alpha=0.6)
+
+                vals = self._detrend_vals(vals)
+                sub_ax.plot(x, vals, color=color, linewidth=0.9)
+
+                # Trendline + slope annotation
+                if n_reps > 1:
+                    z    = np.polyfit(x, vals, 1)
+                    poly = np.poly1d(z)
+                    sub_ax.plot(x, poly(x), color="#ffffff", linewidth=0.7,
+                                linestyle="--", alpha=0.5)
+                    slope     = z[0]
+                    slope_txt = (f"+{slope:.4f}" if slope >= 0 else f"{slope:.4f}") + " \u03bcm/rep"
+                    slope_col = DANGER if slope > 0 else SUCCESS
+                    sub_ax.annotate(
+                        slope_txt,
+                        xy=(x[-1], poly(x[-1])),
+                        xytext=(-6, 4), textcoords="offset points",
+                        ha="right", va="bottom", fontsize=6,
+                        color=slope_col, fontfamily="Courier New",
+                        bbox=dict(boxstyle="round,pad=0.2", fc=PANEL,
+                                  ec=slope_col, alpha=0.85, lw=0.6))
+
+                sub_ax.set_ylabel(f"{tgt}", fontsize=6, color=color,
+                                  rotation=0, labelpad=28, va="center")
+                sub_ax.yaxis.label.set_color(color)
+
+                if i < n_tgt - 1:
+                    sub_ax.set_xticklabels([])
+                else:
+                    tick_step = max(1, n_reps // 20)
+                    shown_x   = x[::tick_step]
+                    shown_lbl = x_labels[::tick_step]
+                    sub_ax.set_xticks(shown_x)
+                    sub_ax.set_xticklabels(shown_lbl, rotation=90, ha="right", fontsize=5)
+
+                sub_ax.set_xlim(x[0], x[-1])
+
+            if self._drift_axes:
+                _ord2 = "linear" if self._detrend_order.get()==1 else "quadratic"
+                _det2 = f", {_ord2} trend removed" if self._detrend_var.get() else ""
+                self._drift_axes[0].set_title(
+                    f"Drift View \u2014 Error vs Repetition Number  (dashed = trend line{_det2})",
+                    fontsize=10, color=TEXT, pad=6)
+
+            self._fig.text(x0 - 0.045, y0 + h_total / 2, "Error (\u03bcm)",
+                           va="center", ha="center", rotation=90,
+                           fontsize=9, color=TEXT)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    # Check required packages before launching
+    missing = []
+    for pkg, imp in [("pandas", "pandas"), ("numpy", "numpy"),
+                     ("matplotlib", "matplotlib")]:
+        try:
+            __import__(imp)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk(); root.withdraw()
+            messagebox.showerror(
+                "Missing packages",
+                f"Please install the following packages and try again:\n\n"
+                f"  pip install {' '.join(missing)}"
+            )
+        except Exception:
+            print(f"ERROR: Missing packages: {', '.join(missing)}")
+            print(f"Install with:  pip install {' '.join(missing)}")
+        sys.exit(1)
+
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as exc:
+        import traceback
+        err = traceback.format_exc()
+        try:
+            import tkinter.messagebox as mb
+            mb.showerror("Startup Error", err)
+        except Exception:
+            print("STARTUP ERROR:\n", err)
+        sys.exit(1)
