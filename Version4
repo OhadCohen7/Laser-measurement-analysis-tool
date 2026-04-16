@@ -7,9 +7,11 @@ V3 - New feature in this version:
     2. load bunch of files and do the analysis for all file automaticlly.
     3. Load bunch mode - analysis range according to user definition.
     4. trend removal (linear or Polinomial)
+    
+V4 - New feature in this version:
+    1. The 50% and 99% precentail are presented in the 3sigma graph itself.
 
 """
-
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -530,18 +532,7 @@ class App(tk.Tk):
             tk.Label(row, text=f"{sv:.5f}", bg=PANEL, fg=col,
                      font=("Courier New", 8), anchor="e").pack(side=tk.RIGHT)
 
-        # Divider + percentiles
-        p50 = float(np.percentile(sigma_vals, 50))
-        p99 = float(np.percentile(sigma_vals, 99))
-        tk.Frame(self.sigma_frame, bg=BORDER, height=1).pack(fill=tk.X, pady=6)
-        for label, value, color in [("P50 (\u03bcm)", p50, ACCENT),
-                                     ("P99 (\u03bcm)", p99, ACCENT2)]:
-            row = tk.Frame(self.sigma_frame, bg=PANEL)
-            row.pack(fill=tk.X, pady=2)
-            tk.Label(row, text=label, bg=PANEL, fg=color,
-                     font=("Courier New", 8, "bold"), anchor="w").pack(side=tk.LEFT)
-            tk.Label(row, text=f"{value:.5f}", bg=PANEL, fg=color,
-                     font=("Courier New", 8, "bold"), anchor="e").pack(side=tk.RIGHT)
+
 
     # ── Batch processing ─────────────────────────────────────────────────────
 
@@ -857,7 +848,7 @@ class App(tk.Tk):
 
         fig = plt.Figure(figsize=(12, 8), facecolor=BG)
         gs  = gridspec.GridSpec(2, 1, figure=fig, hspace=0.55,
-                                top=0.95, bottom=0.10, left=0.07, right=0.82)
+                                top=0.95, bottom=0.10, left=0.07, right=0.78)
         ax1 = fig.add_subplot(gs[0])
         ax2 = fig.add_subplot(gs[1])
         self._fig = fig
@@ -951,6 +942,41 @@ class App(tk.Tk):
             ax2.set_xticklabels([str(t) for t in self.targets],
                                 rotation=45, ha="right", fontsize=8)
             ax2.set_xlim(-0.5, len(self.targets) - 0.5)
+
+        # P50 / P99 lines on bar chart
+        _dir = self._direction.get()
+        if detrending:
+            p50_raw = float(np.percentile(bar_sigma_raw, 50))
+            p99_raw = float(np.percentile(bar_sigma_raw, 99))
+            p50_det = float(np.percentile(bar_sigma_det, 50))
+            p99_det = float(np.percentile(bar_sigma_det, 99))
+            _xlim = ax2.get_xlim()
+            for yval, lbl, col, ls in [
+                    (p50_raw, f"P50 raw\n{p50_raw:.4f}", (0.75, 0.55, 0.35), "--"),
+                    (p99_raw, f"P99 raw\n{p99_raw:.4f}", (0.90, 0.35, 0.35), "--"),
+                    (p50_det, f"P50 det\n{p50_det:.4f}", ACCENT,             ":"),
+                    (p99_det, f"P99 det\n{p99_det:.4f}", ACCENT2,            ":"),
+            ]:
+                ax2.axhline(yval, color=col, linewidth=1.0, linestyle=ls, alpha=0.8)
+                ax2.text(_xlim[1] + 0.05, yval, lbl, color=col,
+                         fontsize=6.5, fontfamily="Courier New",
+                         va="center", ha="left", clip_on=False,
+                         bbox=dict(boxstyle="round,pad=0.15", fc=PANEL, ec=col,
+                                   alpha=0.9, lw=0.6))
+        else:
+            p50_v = float(np.percentile(bar_sigma_raw, 50))
+            p99_v = float(np.percentile(bar_sigma_raw, 99))
+            _xlim = ax2.get_xlim()
+            for yval, lbl, col, ls in [
+                    (p50_v, f"P50\n{p50_v:.4f}", ACCENT,  "--"),
+                    (p99_v, f"P99\n{p99_v:.4f}", ACCENT2, "--"),
+            ]:
+                ax2.axhline(yval, color=col, linewidth=1.0, linestyle=ls, alpha=0.8)
+                ax2.text(_xlim[1] + 0.05, yval, lbl, color=col,
+                         fontsize=7, fontfamily="Courier New",
+                         va="center", ha="left", clip_on=False,
+                         bbox=dict(boxstyle="round,pad=0.18", fc=PANEL, ec=col,
+                                   alpha=0.9, lw=0.7))
 
         # Embed canvas
         canvas = FigureCanvasTkAgg(fig, master=self.canvas_frame)
