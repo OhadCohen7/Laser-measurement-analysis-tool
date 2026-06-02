@@ -2,14 +2,20 @@
 """
 Position Measurement Analysis Tool
 Interactive GUI for analyzing repeatability measurements from CSV files.
+
+Position Measurement Analysis Tool
+Interactive GUI for analyzing repeatability measurements from CSV files.
 V3 - New feature in this version:
     1. Seperate analysis for foward and backward direction.
     2. load bunch of files and do the analysis for all file automaticlly.
     3. Load bunch mode - analysis range according to user definition.
     4. trend removal (linear or Polinomial)
-    
-V4 - New feature in this version:
-    1. The 50% and 99% precentail are presented in the 3sigma graph itself.
+
+V4.1 - 
+  1. The 50% and 99% precentail are presented in the 3sigma graph itself.
+  2. backlash calculation for each measurment point (delta between average of 
+    positive samples and average of negative sampeles)
+
 
 """
 
@@ -318,9 +324,22 @@ class App(tk.Tk):
                 command=self._on_direction_change
             ).pack(side=tk.LEFT, padx=2)
 
-        # Table area (filled by _refresh_sigma_table)
-        self.sigma_frame = tk.Frame(parent, bg=PANEL)
-        self.sigma_frame.pack(fill=tk.X)
+        # Mini-notebook: 3σ tab | Backlash tab
+        self._results_nb = ttk.Notebook(parent)
+        self._results_nb.pack(fill=tk.X, pady=(0, 2))
+
+        self._tab_sigma     = tk.Frame(self._results_nb, bg=PANEL)
+        self._tab_backlash  = tk.Frame(self._results_nb, bg=PANEL)
+        self._results_nb.add(self._tab_sigma,    text=" 3σ ")
+        self._results_nb.add(self._tab_backlash, text=" Backlash ")
+
+        # sigma_frame lives inside the 3σ tab
+        self.sigma_frame = tk.Frame(self._tab_sigma, bg=PANEL)
+        self.sigma_frame.pack(fill=tk.X, padx=2, pady=2)
+
+        # backlash_frame lives inside the Backlash tab
+        self.backlash_frame = tk.Frame(self._tab_backlash, bg=PANEL)
+        self.backlash_frame.pack(fill=tk.X, padx=2, pady=2)
 
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, pady=10)
 
@@ -505,6 +524,68 @@ class App(tk.Tk):
     def _on_direction_change(self):
         if self._fig is not None and self._sigma_vals:
             self._refresh_sigma_table(self._start, self._end)
+
+    def _compute_backlash(self, start, end):
+        """For each target return (avg_fwd, avg_bwd, delta=avg_fwd - avg_bwd).
+        Fwd runs are even-indexed columns (0,2,4...), bwd are odd (1,3,5...).
+        Returns list of (tgt, avg_fwd, avg_bwd, delta) in target order.
+        """
+        result = []
+        for tgt in self.targets:
+            v   = self.data[tgt][start:end]
+            fwd = v[0::2]
+            bwd = v[1::2]
+            af  = float(np.nanmean(fwd[np.isfinite(fwd)])) if np.any(np.isfinite(fwd)) else float("nan")
+            ab  = float(np.nanmean(bwd[np.isfinite(bwd)])) if np.any(np.isfinite(bwd)) else float("nan")
+            result.append((tgt, af, ab, af - ab))
+        return result
+
+    def _refresh_backlash_table(self, start, end):
+        """Rebuild the backlash tab content."""
+        for w in self.backlash_frame.winfo_children():
+            w.destroy()
+
+        data = self._compute_backlash(start, end)
+        deltas = [abs(d) for _, _, _, d in data]
+        max_d  = max(deltas) if deltas else 1.0
+        min_d  = min(deltas) if deltas else 0.0
+
+        # Header row
+        hdr = tk.Frame(self.backlash_frame, bg=BORDER)
+        hdr.pack(fill=tk.X, pady=(0, 2))
+        for txt, w in [("Target", 7), ("Fwd avg", 8), ("Bwd avg", 8), ("Delta", 8)]:
+            tk.Label(hdr, text=txt, bg=BORDER, fg=ACCENT,
+                     font=("Courier New", 7, "bold"), width=w, anchor="e"
+                     ).pack(side=tk.LEFT, padx=1)
+
+        for tgt, af, ab, delta in data:
+            row = tk.Frame(self.backlash_frame, bg=PANEL)
+            row.pack(fill=tk.X, pady=1)
+            abs_d = abs(delta)
+            col   = SUCCESS if abs_d == min_d else (DANGER if abs_d == max_d else TEXT)
+            for val, w in [(str(tgt), 7),
+                           (f"{af:.4f}" if not (af!=af) else "N/A", 8),
+                           (f"{ab:.4f}" if not (ab!=ab) else "N/A", 8),
+                           (f"{delta:+.4f}" if not (delta!=delta) else "N/A", 8)]:
+                fg = col if val == f"{delta:+.4f}" else SUBTEXT
+                tk.Label(row, text=val, bg=PANEL, fg=fg,
+                         font=("Courier New", 7), width=w, anchor="e"
+                         ).pack(side=tk.LEFT, padx=1)
+
+        # Summary: max, mean backlash
+        tk.Frame(self.backlash_frame, bg=BORDER, height=1).pack(fill=tk.X, pady=4)
+        mean_d  = float(np.nanmean([abs(d) for _, _, _, d in data]))
+        max_tgt = data[deltas.index(max_d)][0] if data else ""
+        for lbl, val, clr in [
+                ("Max |Δ|", f"{max_d:.4f} @ {max_tgt}", DANGER),
+                ("Mean |Δ|", f"{mean_d:.4f}", ACCENT2),
+        ]:
+            srow = tk.Frame(self.backlash_frame, bg=PANEL)
+            srow.pack(fill=tk.X, pady=1)
+            tk.Label(srow, text=lbl, bg=PANEL, fg=clr,
+                     font=("Courier New", 8, "bold"), anchor="w").pack(side=tk.LEFT)
+            tk.Label(srow, text=val, bg=PANEL, fg=clr,
+                     font=("Courier New", 8), anchor="e").pack(side=tk.RIGHT)
 
     def _refresh_sigma_table(self, start, end):
         sigma_vals = self._compute_sigma_vals(start, end)
@@ -998,6 +1079,7 @@ class App(tk.Tk):
 
         # Sidebar 3σ table (respects current direction toggle)
         self._refresh_sigma_table(start, end)
+        self._refresh_backlash_table(start, end)
 
         # Reset checkboxes
         for var in self._chk_vars.values(): var.set(True)
